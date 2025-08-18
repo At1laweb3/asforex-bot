@@ -5,6 +5,9 @@ const path = require("path");
 const TelegramBot = require("node-telegram-bot-api");
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 const { google } = require("googleapis");
+const express = require("express");
+
+/* ---------------- Env ---------------- */
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_URL   = process.env.API_URL; // npr. https://xxxx.trycloudflare.com/mt4/create
@@ -18,7 +21,32 @@ if (!BOT_TOKEN || !API_URL) {
   process.exit(1);
 }
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+/* ---------------- Persistence (za broadcast) ---------------- */
+
+const DATA_DIR = path.join(__dirname, "data");
+const CHATS_FILE = path.join(DATA_DIR, "chats.json");
+fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(CHATS_FILE)) fs.writeFileSync(CHATS_FILE, "[]");
+
+function loadChats() {
+  try { return JSON.parse(fs.readFileSync(CHATS_FILE, "utf8")); } catch { return []; }
+}
+function saveChats(arr) {
+  try { fs.writeFileSync(CHATS_FILE, JSON.stringify(arr, null, 2)); } catch {}
+}
+function upsertChat(chatId, from) {
+  const arr = loadChats();
+  const idx = arr.findIndex(c => c.id === chatId);
+  const item = {
+    id: chatId,
+    username: from?.username || "",
+    first: from?.first_name || "",
+    last: from?.last_name || "",
+    updated_at: new Date().toISOString()
+  };
+  if (idx >= 0) arr[idx] = item; else arr.push(item);
+  saveChats(arr);
+}
 
 /* ---------------- Helpers ---------------- */
 
@@ -40,8 +68,7 @@ function buildNameFromTelegram(user) {
     const suffix = String(user?.id || Math.floor(Math.random()*1e6)).slice(-5);
     candidate = (candidate + " Trader " + suffix).trim();
   }
-  // sigurnosno skratimo na 40
-  if (candidate.length > 40) candidate = candidate.slice(0, 40);
+  if (candidate.length > 40) candidate = candidate.slice(0, 40); // safety
   return candidate;
 }
 
@@ -52,21 +79,28 @@ function isValidEmail(s) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
 }
 
+/** Čista i robusna normalizacija na +381… */
 function normalizePhone(raw) {
-  let p = (raw || "").replace(/[^\d+]/g, "");
+  let p = String(raw || "").replace(/[^\d+]/g, "");
+
+  // ukloni vodeće nule i plus višak
+  p = p.replace(/^00/, "+");
+  if (p.startsWith("+")) {
+    // već ima +; ukloni sve što nije broj od + nadalje
+    p = "+" + p.replace(/[^\d]/g, "").replace(/^\+/, "");
+  }
+
+  // ako i dalje nema + na početku – forisiraj +381
   if (!p.startsWith("+")) {
-    // forsiramo srpski prefiks +381; skidamo leading 0 ako postoji
-    if (p.startsWith("0")) p = p.slice(1);
-    if (p.startsWith("381")) p = "+" + p;
-    else p = "+381" + p;
+    p = p.replace(/^0+/, ""); // skini vodeće nule
+    p = "+381" + p;
   }
-  if (!p.startsWith("+381")) {
-    // ako je stigao neki drugi kod, ipak prebacimo na +381
-    p = p.replace(/^\+?\d+/, "+381") + p.replace(/^\+?\d+/, "");
-    // praktično +381 + ostatak unosa; najčešći slučaj je da korisnik upiše bez +
-    if (!p.startsWith("+381")) p = "+381" + p.replace(/[^\d]/g, "");
-  }
-  return p;
+
+  // mapiraj sve u +381… (čak i ako je korisnik uneo drugi kod)
+  // zadrži samo cifre posle eventualnog prefiksa
+  const digits = p.replace(/[^\d]/g, "");
+  const rest   = digits.replace(/^\d{0,3}/, ""); // odseci potencijalni kod
+  return "+381" + rest.replace(/^0+/, ""); // ukloni dupli 0 odmah posle koda
 }
 
 /* --------- Google Sheets (opciono) ---------- */
@@ -100,7 +134,9 @@ async function appendSignupRowSafe(values) {
   }
 }
 
-/* --------------- State --------------- */
+/* --------------- Telegram bot --------------- */
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const sessions = {}; // chatId -> { step, name, email, phone }
 
 /* --------------- UI Flows --------------- */
@@ -154,6 +190,7 @@ function showEditMenu(chatId) {
 /* --------------- Commands --------------- */
 bot.onText(/\/start/i, (msg) => {
   const chatId = msg.chat.id;
+  upsertChat(chatId, msg.from);        // zapamti chat za broadcast
   const name = buildNameFromTelegram(msg.from);
   sessions[chatId] = { step: "email", name, email: "", phone: "" };
   askEmail(chatId);
@@ -165,8 +202,12 @@ bot.onText(/^\/broadcast (.+)$/s, async (msg, match) => {
     return bot.sendMessage(chatId, "Nemaš ovlašćenje za /broadcast.");
   }
   const text = match[1].trim();
-  // simple broadcast (bez memorizacije svih chatova ovde)
-  bot.sendMessage(chatId, "OK, broadcast poslat (pokušaj).");
+  const chats = loadChats();
+  let ok = 0, fail = 0;
+  for (const c of chats) {
+    try { await bot.sendMessage(c.id, text); ok++; } catch { fail++; }
+  }
+  bot.sendMessage(chatId, `Broadcast poslat. OK: ${ok}, FAIL: ${fail}`);
 });
 
 /* --------------- Text handler --------------- */
@@ -249,8 +290,7 @@ bot.on("callback_query", async (q) => {
     bot.sendMessage(chatId, "✅ Registracija tvog DEMO naloga je u toku, molimo sačekaj...");
 
     const payload = {
-      // server će sam raspakovati u first/last ako nisu prosleđeni
-      name: s.name,
+      name:  s.name,   // MT4 Name (min 5 char već osigurano)
       email: s.email,
       phone: s.phone
     };
@@ -311,8 +351,7 @@ bot.on("callback_query", async (q) => {
 });
 
 /* --------------- Minimalni web (Railway health) --------------- */
-const express = require("express");
 const app = express();
-app.get("/", (_req,res)=>res.send("ok"));
+app.get("/", (_req, res) => res.send("ok"));
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, ()=>console.log("Web listening on", PORT));
+app.listen(PORT, () => console.log("Web listening on", PORT));
