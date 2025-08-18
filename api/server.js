@@ -1,4 +1,4 @@
-// server.js ó MT4 Demo creator (AHK v1 + MT4 Portable)
+Ôªø// server.js ‚Äî MT4 Demo creator (AHK v1 + MT4 Portable)
 // API: POST /mt4/create  {first,last,email,phone}
 
 const express = require("express");
@@ -21,7 +21,7 @@ const OUT_FILE = path.join(OUT_DIR, "result.json");
 const AHK_EXE_ENV    = process.env.AHK_EXE || "";
 const AHK_SCRIPT_ENV = process.env.AHK_SCRIPT || "";
 
-// Najceöce lokacije AHK v1 (x64 prvo). Poötujemo env ako je zadat.
+// Najce≈°ce lokacije AHK v1 (x64 prvo). Po≈°tujemo env ako je zadat.
 const AHK_EXE_CANDIDATES = [
   AHK_EXE_ENV,
   "C:\\Program Files\\AutoHotkey\\AutoHotkeyU64.exe",
@@ -91,11 +91,11 @@ app.post("/mt4/create", async (req, res) => {
           return res.status(500).json({ ok: false, error: "No result file produced by AHK" });
         }
 
-        // Vrati baö ono öto je AHK upisao (bez duplog parse-a)
+        // Vrati ba≈° ono ≈°to je AHK upisao (bez duplog parse-a)
         let raw = fs.readFileSync(OUT_FILE, "utf8");
         raw = raw.replace(/^\uFEFF/, "").trim(); // skini BOM
 
-        // Probaj da ispeglaö duple zagrade {{...}} ako ih ima
+        // Probaj da ispegla≈° duple zagrade {{...}} ako ih ima
         let payloadText = raw;
         try {
           JSON.parse(raw);
