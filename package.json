@@ -1,0 +1,15 @@
+{
+  "name": "asforex-bot",
+  "version": "1.0.0",
+  "description": "ASForex Telegram bot -> MT4 demo + Google Sheets",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "tg": "node bot.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "googleapis": "^129.0.0",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
