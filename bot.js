@@ -1,109 +1,55 @@
-﻿// bot.js — Telegram → MT4 demo create (email + phone) + Google Sheet log + confirm UI
+// bot.js — Telegram → MT4 demo create → confirm/edit flow + Google Sheet log (clean UI)
+// env: BOT_TOKEN, API_URL, ADMIN_IDS, SHEET_ID, (SHEET_TAB=signups),
+//      GOOGLE_CREDENTIALS (JSON string) ILI GOOGLE_APPLICATION_CREDENTIALS (path)
 
 const fs = require("fs");
 const path = require("path");
 const TelegramBot = require("node-telegram-bot-api");
-const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 const { google } = require("googleapis");
-const express = require("express");
-
-/* ---------------- Env ---------------- */
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const API_URL   = process.env.API_URL; // npr. https://xxxx.trycloudflare.com/mt4/create
+const API_URL   = process.env.API_URL || "http://localhost:8081/mt4/create";
 const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
 
 const SHEET_ID  = process.env.SHEET_ID || "1tPpGTvhC2gaSy-7SAyrH55eigbyv8x_vTf9MSgOATwE";
 const SHEET_TAB = process.env.SHEET_TAB || "signups";
 
-if (!BOT_TOKEN || !API_URL) {
-  console.error("Missing BOT_TOKEN or API_URL");
-  process.exit(1);
+if (!BOT_TOKEN) {
+  console.error("Missing BOT_TOKEN"); process.exit(1);
 }
 
-/* ---------------- Persistence (za broadcast) ---------------- */
+// ------- KONFIG TEKSTOVA / LINKOVA -------
+const CONTACT_URL = "https://t.me/aleksa_asf01";
 
-const DATA_DIR = path.join(__dirname, "data");
+const MSG_WELCOME =
+  "Dobrodosao u ASForex Tim!\n\n" +
+  "Za pocetak upisi svoj Email, kako bi nastavili sa tvojom registracijom za tvoj DEMO nalog!";
+
+const MSG_ASK_PHONE =
+  "Hvala! ✅\n\nSada upiši broj telefona (npr 0611234567):";
+
+function formatAccountMsg({ login, password, server = "MetaQuotes-Demo" }) {
+  return (
+    "Tvoj nalog je spreman! molim te pogledaj ovaj video ispod kako bih se povezao na nalog i pratio nase rezultate!\n\n" +
+    "Ako ti je potrebna pomoć, klikni na dugme ispod.\n\n" +
+    `<pre>Login:    ${login}
+Password: ${password}
+Server:   ${server}
+Platform: MT4</pre>`
+  );
+}
+
+// ========== lokalni storage chat-ova (za broadcast) ==========
+const DATA_DIR = "C:\\bot\\data";
 const CHATS_FILE = path.join(DATA_DIR, "chats.json");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(CHATS_FILE)) fs.writeFileSync(CHATS_FILE, "[]");
 
-function loadChats() {
-  try { return JSON.parse(fs.readFileSync(CHATS_FILE, "utf8")); } catch { return []; }
-}
-function saveChats(arr) {
-  try { fs.writeFileSync(CHATS_FILE, JSON.stringify(arr, null, 2)); } catch {}
-}
-function upsertChat(chatId, from) {
-  const arr = loadChats();
-  const idx = arr.findIndex(c => c.id === chatId);
-  const item = {
-    id: chatId,
-    username: from?.username || "",
-    first: from?.first_name || "",
-    last: from?.last_name || "",
-    updated_at: new Date().toISOString()
-  };
-  if (idx >= 0) arr[idx] = item; else arr.push(item);
-  saveChats(arr);
-}
+const loadChats = () => { try { return JSON.parse(fs.readFileSync(CHATS_FILE, "utf8")); } catch { return []; } };
+const saveChats = (arr) => { try { fs.writeFileSync(CHATS_FILE, JSON.stringify(arr, null, 2)); } catch {} };
+const upsertChat = (chat) => { const arr = loadChats(); const i = arr.findIndex(c=>c.id===chat.id); if(i>=0) arr[i]=chat; else arr.push(chat); saveChats(arr); };
 
-/* ---------------- Helpers ---------------- */
-
-function onlyLettersDigitsSpaces(s) {
-  return (s || "").normalize("NFKD").replace(/[^\p{L}\p{N}\s_-]/gu, "").trim();
-}
-
-function buildNameFromTelegram(user) {
-  // prioritet: @username → "At1laweb3" ; fallback: "First Last" ; zadnje: "Trader"
-  let candidate =
-    user?.username
-      ? user.username
-      : `${user?.first_name || ""} ${user?.last_name || ""}`.trim() || "Trader";
-
-  candidate = onlyLettersDigitsSpaces(candidate).replace(/_/g, " ").replace(/\s+/g, " ");
-
-  // MT4 Name: min 5 char → dopuni ako treba
-  if (candidate.length < 5) {
-    const suffix = String(user?.id || Math.floor(Math.random()*1e6)).slice(-5);
-    candidate = (candidate + " Trader " + suffix).trim();
-  }
-  if (candidate.length > 40) candidate = candidate.slice(0, 40); // safety
-  return candidate;
-}
-
-function normalizeEmail(s) {
-  return (s || "").trim();
-}
-function isValidEmail(s) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
-}
-
-/** Čista i robusna normalizacija na +381… */
-function normalizePhone(raw) {
-  let p = String(raw || "").replace(/[^\d+]/g, "");
-
-  // ukloni vodeće nule i plus višak
-  p = p.replace(/^00/, "+");
-  if (p.startsWith("+")) {
-    // već ima +; ukloni sve što nije broj od + nadalje
-    p = "+" + p.replace(/[^\d]/g, "").replace(/^\+/, "");
-  }
-
-  // ako i dalje nema + na početku – forisiraj +381
-  if (!p.startsWith("+")) {
-    p = p.replace(/^0+/, ""); // skini vodeće nule
-    p = "+381" + p;
-  }
-
-  // mapiraj sve u +381… (čak i ako je korisnik uneo drugi kod)
-  // zadrži samo cifre posle eventualnog prefiksa
-  const digits = p.replace(/[^\d]/g, "");
-  const rest   = digits.replace(/^\d{0,3}/, ""); // odseci potencijalni kod
-  return "+381" + rest.replace(/^0+/, ""); // ukloni dupli 0 odmah posle koda
-}
-
-/* --------- Google Sheets (opciono) ---------- */
+// ========== Google Sheets helper ==========
 async function getSheetsClient() {
   const scopes = ["https://www.googleapis.com/auth/spreadsheets"];
   let auth;
@@ -113,245 +59,245 @@ async function getSheetsClient() {
   } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     auth = new google.auth.GoogleAuth({ keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS, scopes });
   } else {
-    return null; // nije podešeno → preskoči
+    throw new Error("Missing GOOGLE_CREDENTIALS or GOOGLE_APPLICATION_CREDENTIALS");
   }
   return google.sheets({ version: "v4", auth: await auth.getClient() });
 }
 
-async function appendSignupRowSafe(values) {
+async function appendSignupRow(row) {
   if (!SHEET_ID) return;
   try {
     const sheets = await getSheetsClient();
-    if (!sheets) return;
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: `${SHEET_TAB}!A1`,
       valueInputOption: "USER_ENTERED",
-      requestBody: { values: [values] },
+      requestBody: { values: [row] }
     });
   } catch (e) {
-    console.error("Sheets append error:", e.message);
+    console.error("Google Sheets append error:", e.message);
   }
 }
 
-/* --------------- Telegram bot --------------- */
-
+// ========== Telegram bot ==========
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-const sessions = {}; // chatId -> { step, name, email, phone }
 
-/* --------------- UI Flows --------------- */
+// sesije: chatId -> { step, first, last, email, phone }
+const sessions = {};
+
+const isValidEmail = (s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s||""));
+const cleanedPhone = (s) => (s || "").replace(/[^\d+]/g, "");
+
+// UI helpers
 function askEmail(chatId) {
   sessions[chatId].step = "email";
-  bot.sendMessage(
-    chatId,
-    "Dobrodošao u ASForex tim! 👋\n\nZa početak upiši svoj **Email**:",
-    { parse_mode: "Markdown" }
-  );
+  bot.sendMessage(chatId, MSG_WELCOME);
 }
 function askPhone(chatId) {
   sessions[chatId].step = "phone";
-  bot.sendMessage(
-    chatId,
-    "Hvala! ✅\n\nSada upiši **broj telefona** (sa prefiksom, npr. `+3816...`):",
-    { parse_mode: "Markdown" }
-  );
+  bot.sendMessage(chatId, MSG_ASK_PHONE);
 }
-function showConfirm(chatId) {
-  const s = sessions[chatId];
+function askConfirm(chatId) {
+  const s = sessions[chatId] || {};
+  sessions[chatId].step = "confirm";
   const text =
-    "Proveri podatke:\n" +
-    `• Ime i prezime: ${s.name}\n` +
-    `• Email: ${s.email}\n` +
-    `• Telefon: ${s.phone}\n\n` +
-    "Da li želiš da pošaljem prijavu ili da izmeniš podatke?";
-  const kb = {
-    inline_keyboard: [
-      [
-        { text: "✅ Ne, pošalji prijavu", callback_data: "confirm_send" },
-        { text: "✏️ Želim da promenim", callback_data: "edit_choose" },
-      ],
-    ],
-  };
-  bot.sendMessage(chatId, text, { reply_markup: kb });
-}
-function showEditMenu(chatId) {
-  const kb = {
-    inline_keyboard: [
-      [
-        { text: "✉️ Promeni Email", callback_data: "edit_email" },
-        { text: "📞 Promeni Telefon", callback_data: "edit_phone" },
-      ],
-      [{ text: "⬅️ Nazad", callback_data: "back_confirm" }],
-    ],
-  };
-  bot.sendMessage(chatId, "Šta želiš da izmeniš?", { reply_markup: kb });
-}
-
-/* --------------- Commands --------------- */
-bot.onText(/\/start/i, (msg) => {
-  const chatId = msg.chat.id;
-  upsertChat(chatId, msg.from);        // zapamti chat za broadcast
-  const name = buildNameFromTelegram(msg.from);
-  sessions[chatId] = { step: "email", name, email: "", phone: "" };
-  askEmail(chatId);
-});
-
-bot.onText(/^\/broadcast (.+)$/s, async (msg, match) => {
-  const chatId = msg.chat.id;
-  if (!ADMIN_IDS.includes(String(chatId))) {
-    return bot.sendMessage(chatId, "Nemaš ovlašćenje za /broadcast.");
-  }
-  const text = match[1].trim();
-  const chats = loadChats();
-  let ok = 0, fail = 0;
-  for (const c of chats) {
-    try { await bot.sendMessage(c.id, text); ok++; } catch { fail++; }
-  }
-  bot.sendMessage(chatId, `Broadcast poslat. OK: ${ok}, FAIL: ${fail}`);
-});
-
-/* --------------- Text handler --------------- */
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const s = sessions[chatId];
-  if (!s) return;              // ignorisi ako nema sesije
-  if (msg.text && msg.text.startsWith("/")) return; // ignoriši komande
-
-  if (s.step === "email") {
-    const e = normalizeEmail(msg.text);
-    if (!isValidEmail(e)) return bot.sendMessage(chatId, "Email ne deluje ispravno. Probaj ponovo:");
-    s.email = e;
-    askPhone(chatId);
-    return;
-  }
-
-  if (s.step === "phone") {
-    const p = normalizePhone(msg.text);
-    if (!/^\+381\d{6,}$/.test(p)) {
-      return bot.sendMessage(chatId, "Telefon ne deluje ispravno. Pošalji u formatu `+3816...`.", { parse_mode: "Markdown" });
+    "Proveri podatke pre slanja prijave:\n" +
+    `• Email: ${s.email || "—"}\n` +
+    `• Telefon: ${s.phone || "—"}\n\n` +
+    "Da li želiš da promeniš svoje podatke, ili da pošaljem prijavu?";
+  bot.sendMessage(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ Ne, pošalji prijavu", callback_data: "confirm_send" },
+          { text: "✏️ Želim da promenim", callback_data: "confirm_change" }
+        ]
+      ]
     }
-    s.phone = p;
-    showConfirm(chatId);
-    return;
-  }
-
-  // ako je u edit modu
-  if (s.step === "edit_email") {
-    const e = normalizeEmail(msg.text);
-    if (!isValidEmail(e)) return bot.sendMessage(chatId, "Email ne deluje ispravno. Probaj ponovo:");
-    s.email = e;
-    showConfirm(chatId);
-    return;
-  }
-  if (s.step === "edit_phone") {
-    const p = normalizePhone(msg.text);
-    if (!/^\+381\d{6,}$/.test(p)) {
-      return bot.sendMessage(chatId, "Telefon ne deluje ispravno. Pošalji u formatu `+3816...`.", { parse_mode: "Markdown" });
+  });
+}
+function askWhatToChange(chatId) {
+  sessions[chatId].step = "edit_choice";
+  bot.sendMessage(chatId, "Šta želiš da promeniš?", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📧 Email", callback_data: "change_email" },
+          { text: "📱 Broj telefona", callback_data: "change_phone" }
+        ],
+        [{ text: "⬅️ Nazad", callback_data: "back_confirm" }]
+      ]
     }
-    s.phone = p;
-    showConfirm(chatId);
-    return;
-  }
-});
+  });
+}
 
-/* --------------- Callback buttons --------------- */
-bot.on("callback_query", async (q) => {
-  const chatId = q.message.chat.id;
+async function createAccount(chatId, fromUser) {
   const s = sessions[chatId];
-  if (!s) return bot.answerCallbackQuery(q.id);
+  if (!s) return;
 
-  if (q.data === "edit_choose") {
-    bot.answerCallbackQuery(q.id);
-    showEditMenu(chatId);
-    return;
-  }
-  if (q.data === "edit_email") {
-    bot.answerCallbackQuery(q.id);
-    s.step = "edit_email";
-    bot.sendMessage(chatId, "Unesi novi **Email**:", { parse_mode: "Markdown" });
-    return;
-  }
-  if (q.data === "edit_phone") {
-    bot.answerCallbackQuery(q.id);
-    s.step = "edit_phone";
-    bot.sendMessage(chatId, "Unesi novi **broj telefona** (format `+3816...`):", { parse_mode: "Markdown" });
-    return;
-  }
-  if (q.data === "back_confirm") {
-    bot.answerCallbackQuery(q.id);
-    showConfirm(chatId);
-    return;
-  }
+  sessions[chatId].step = "creating";
+  await bot.sendMessage(chatId, "✅ Registracija tvog DEMO naloga je u toku, molimo sačekaj...");
 
-  if (q.data === "confirm_send") {
-    bot.answerCallbackQuery(q.id);
-
-    // šaljemo zahtev API-ju
-    bot.sendMessage(chatId, "✅ Registracija tvog DEMO naloga je u toku, molimo sačekaj...");
-
+  try {
     const payload = {
-      name:  s.name,   // MT4 Name (min 5 char već osigurano)
+      first: s.first || "User",
+      last:  s.last  || "",
       email: s.email,
       phone: s.phone
     };
 
-    try {
-      const res = await fetch(API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
 
-      const txt = await res.text();
-      let data;
-      try { data = JSON.parse(txt); } catch { data = { ok:false, error:"Bad JSON", raw:txt }; }
+    const txt = await res.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch { data = { ok:false, error: "Bad JSON from API", raw: txt }; }
 
-      if (!res.ok || !data?.ok) {
-        return bot.sendMessage(chatId, `❌ Greška: ${data?.error || res.statusText}`);
-      }
-
-      const acc = data.account || {};
-      if (acc.login && acc.password) {
-        await bot.sendMessage(
-          chatId,
-          "🎉 Tvoj demo nalog je spreman!\n" +
-          "```\n" +
-          `Login:     ${acc.login}\n` +
-          `Password:  ${acc.password}\n` +
-          (acc.investor ? `Investor: ${acc.investor}\n` : "") +
-          "Server:    MetaQuotes-Demo\n" +
-          "Platforma: MT4\n" +
-          "```\n",
-          { parse_mode: "Markdown" }
-        );
-
-        // log u Google Sheet (opciono)
-        appendSignupRowSafe([
-          new Date().toISOString(),
-          chatId,
-          q.from?.username || "",
-          s.name,
-          s.email,
-          s.phone,
-          acc.login || "",
-          acc.password || "",
-          acc.investor || "",
-          "MetaQuotes-Demo",
-          "telegram"
-        ]);
-      } else {
-        await bot.sendMessage(chatId, `⚠️ Nalog je kreiran, ali login/password nisu detektovani. Detalji: ${data?.mt4?.error || data?.error || "n/a"}`);
-      }
-    } catch (e) {
-      await bot.sendMessage(chatId, `❌ Nešto je puklo: ${String(e)}`);
-    } finally {
-      delete sessions[chatId];
+    if (!res.ok) {
+      await bot.sendMessage(chatId, `Došlo je do greške: ${data?.error || res.statusText}`);
+      return;
     }
+
+    const acc = data.account || {};
+    if (acc.login && acc.password) {
+      await bot.sendMessage(
+        chatId,
+        formatAccountMsg({ login: acc.login, password: acc.password, server: "MetaQuotes-Demo" }),
+        {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📩 Kontaktiraj me!", url: CONTACT_URL }]
+            ]
+          }
+        }
+      );
+
+      // log u Google Sheet (investor ostavljamo prazno da ne razbijamo kolone)
+      const row = [
+        new Date().toISOString(),
+        chatId,
+        fromUser?.username || "",
+        s.first || "",
+        s.last  || "",
+        s.email,
+        s.phone,
+        acc.login || "",
+        acc.password || "",
+        "",                      // Investor prazno
+        "MetaQuotes-Demo",
+        "telegram"
+      ];
+      appendSignupRow(row).catch(console.error);
+    } else {
+      await bot.sendMessage(chatId, `Nije dobijen login/password. Detalji: ${data?.mt4?.error || data?.error || "unknown error"}`);
+    }
+  } catch (e) {
+    await bot.sendMessage(chatId, `Nešto je puklo: ${String(e)}`);
+  } finally {
+    delete sessions[chatId];
+  }
+}
+
+// ========== Komande ==========
+bot.onText(/\/start|\/create/i, async (msg) => {
+  const chatId = msg.chat.id;
+  const first = (msg.from?.first_name || "").trim();
+  const last  = (msg.from?.last_name || "").trim();
+
+  sessions[chatId] = { step: "email", first, last, email: "", phone: "" };
+  upsertChat({ id: chatId, username: msg.from?.username || "", first, last, added_at: new Date().toISOString() });
+
+  askEmail(chatId);
+});
+
+// Broadcast (admin)
+bot.onText(/^\/broadcast (.+)$/s, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!ADMIN_IDS.includes(String(chatId))) return bot.sendMessage(chatId, "Nemaš ovlašcenje za /broadcast.");
+  const text = match[1].trim();
+  const chats = loadChats();
+  let ok = 0, fail = 0;
+  for (const c of chats) { try { await bot.sendMessage(c.id, text); ok++; } catch { fail++; } }
+  bot.sendMessage(chatId, `Broadcast poslat. OK: ${ok}, FAIL: ${fail}`);
+});
+
+// ========== Obrada poruka ==========
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const s = sessions[chatId];
+  if (!s) return;
+  if (msg.data || (typeof msg.text === "string" && msg.text.startsWith("/"))) return;
+
+  if (s.step === "email") {
+    const e = (msg.text || "").trim();
+    if (!isValidEmail(e)) return bot.sendMessage(chatId, "Email ne deluje ispravno. Probaj ponovo:");
+    s.email = e;
+    return askPhone(chatId);
+  }
+
+  if (s.step === "phone") {
+    const p = cleanedPhone(msg.text);
+    if (!p || p.length < 6) return bot.sendMessage(chatId, "Telefon ne deluje ispravno. Pošalji broj u formatu npr 0611234567.");
+    s.phone = p;
+    return askConfirm(chatId);
+  }
+
+  if (s.step === "edit_email") {
+    const e = (msg.text || "").trim();
+    if (!isValidEmail(e)) return bot.sendMessage(chatId, "Email ne deluje ispravno. Probaj ponovo:");
+    s.email = e;
+    return askConfirm(chatId);
+  }
+
+  if (s.step === "edit_phone") {
+    const p = cleanedPhone(msg.text);
+    if (!p || p.length < 6) return bot.sendMessage(chatId, "Telefon ne deluje ispravno. Pošalji broj u formatu npr 0611234567.");
+    s.phone = p;
+    return askConfirm(chatId);
   }
 });
 
-/* --------------- Minimalni web (Railway health) --------------- */
-const app = express();
-app.get("/", (_req, res) => res.send("ok"));
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("Web listening on", PORT));
+// ========== Inline dugmad (callback_query) ==========
+bot.on("callback_query", async (cbq) => {
+  const chatId = cbq.message?.chat?.id;
+  const data = cbq.data;
+  if (!chatId || !sessions[chatId]) return bot.answerCallbackQuery(cbq.id);
+
+  // HOĆEMO da nestane poruka sa dugmadima čim neko klikne:
+  const confirmMsgId = cbq.message.message_id;
+
+  if (data === "confirm_send") {
+    await bot.answerCallbackQuery(cbq.id);
+    try { await bot.deleteMessage(chatId, confirmMsgId); } catch {}
+    return createAccount(chatId, cbq.from);
+  }
+
+  if (data === "confirm_change") {
+    await bot.answerCallbackQuery(cbq.id);
+    try { await bot.deleteMessage(chatId, confirmMsgId); } catch {}
+    return askWhatToChange(chatId);
+  }
+
+  if (data === "change_email") {
+    await bot.answerCallbackQuery(cbq.id);
+    return bot.sendMessage(chatId, "Unesi novi Email:");
+  }
+
+  if (data === "change_phone") {
+    await bot.answerCallbackQuery(cbq.id);
+    return bot.sendMessage(chatId, "Unesi novi broj telefona (npr 0611234567):");
+  }
+
+  if (data === "back_confirm") {
+    await bot.answerCallbackQuery(cbq.id);
+    return askConfirm(chatId);
+  }
+
+  await bot.answerCallbackQuery(cbq.id);
+});
+
+console.log("Telegram bot running (polling)…");
